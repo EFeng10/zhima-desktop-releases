@@ -59,12 +59,14 @@ jobs:
               [Version]::new($parsed.Major, $parsed.Minor, [Math]::Max(0, $parsed.Build), [Math]::Max(0, $parsed.Revision))
           }
           if ((Normalize-Version $ToVersion) -le (Normalize-Version $FromVersion)) { throw 'Target must be newer than source.' }
-          $dataRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ZhimaWater'
+          $localDataRoot = [Environment]::GetFolderPath('LocalApplicationData')
+          $dataRoot = Join-Path $localDataRoot 'ZhimaWater'
           if (Test-Path -LiteralPath $dataRoot) { throw "Refusing existing app data: $dataRoot. Use a fresh disposable Windows runner." }
           if (Get-Process -Name Zhima, Updater -ErrorAction SilentlyContinue) { throw 'An app/helper is already running. Use a fresh runner.' }
           [void][IO.Directory]::CreateDirectory($OutputDirectory)
           $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
-          $fixtureRoot = Join-Path $env:TEMP ('Zhima-UpdateE2E-' + [Guid]::NewGuid().ToString('N'))
+          # TEMP can contain RUNNER~1; use the same long-path known folder as the application.
+          $fixtureRoot = Join-Path $localDataRoot ('Zhima-UpdateE2E-' + [Guid]::NewGuid().ToString('N'))
           [void][IO.Directory]::CreateDirectory($fixtureRoot)
           $targetExe = Join-Path $fixtureRoot 'Zhima.exe'
           $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -213,14 +215,25 @@ jobs:
               Observe-Processes
               if ($null -eq $result) { throw 'No installer result after clicking update. Inspect UI, error.log, and process trace.' }
               Assert-True ($result.state -eq 'Success') ('Installer reached Success, actual=' + $result.state + '; ' + $result.message)
-              Assert-True ($job.targetPath -ieq $targetExe -and $job.parentPid -eq $oldProcess.Id -and $job.parentStartUtcTicks -eq $oldStartTicks) 'Job identifies exact old path and process instance'
+              Write-Log ("Job identity: expectedPath=$targetExe; actualPath=$($job.targetPath); expectedPid=$($oldProcess.Id); actualPid=$($job.parentPid); expectedStartTicks=$oldStartTicks; actualStartTicks=$($job.parentStartUtcTicks)")
+              Assert-True ($job.targetPath -ieq $targetExe) 'Job identifies exact target executable path'
+              Assert-True ($job.parentPid -eq $oldProcess.Id) 'Job identifies exact old process ID'
+              Assert-True ($job.parentStartUtcTicks -eq $oldStartTicks) 'Job identifies exact old process start time'
               $oldProcess.Refresh()
               Assert-True $oldProcess.HasExited 'Old application process exited'
               Assert-True ((Get-Item $targetExe).Length -eq $newManifest.size -and (Get-FileHash $targetExe -Algorithm SHA256).Hash -ieq $newManifest.sha256) 'Same target path contains exact new published EXE'
               Assert-True ((Normalize-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($targetExe).FileVersion)) -eq (Normalize-Version $ToVersion)) 'Installed native version matches target'
               $ack = Read-Json (Join-Path $jobDirectory 'health.json')
               $newProcess = Get-Process -Id $ack.processId -ErrorAction Stop
-              Assert-True ($newProcess.Id -ne $oldProcess.Id -and $newProcess.MainModule.FileName -ieq $targetExe -and $newProcess.StartTime.ToUniversalTime().Ticks -eq $ack.processStartUtcTicks -and $ack.token -ceq $job.healthToken -and $ack.targetPath -ieq $targetExe -and (Normalize-Version $ack.version) -eq (Normalize-Version $ToVersion)) 'New process at original path produced matching full-startup health acknowledgement'
+              $newProcessPath = $newProcess.MainModule.FileName
+              $newStartTicks = $newProcess.StartTime.ToUniversalTime().Ticks
+              Write-Log ("Health identity: expectedPath=$targetExe; processPath=$newProcessPath; ackPath=$($ack.targetPath); oldPid=$($oldProcess.Id); newPid=$($newProcess.Id); actualStartTicks=$newStartTicks; ackStartTicks=$($ack.processStartUtcTicks); ackVersion=$($ack.version)")
+              Assert-True ($newProcess.Id -ne $oldProcess.Id) 'Update launched a distinct new application process'
+              Assert-True ($newProcessPath -ieq $targetExe) 'New process runs from exact original executable path'
+              Assert-True ($newStartTicks -eq $ack.processStartUtcTicks) 'Health acknowledgement identifies exact new process start time'
+              Assert-True ($ack.token -ceq $job.healthToken) 'Health acknowledgement matches random job token'
+              Assert-True ($ack.targetPath -ieq $targetExe) 'Health acknowledgement identifies exact target path'
+              Assert-True ((Normalize-Version $ack.version) -eq (Normalize-Version $ToVersion)) 'Full-startup acknowledgement confirms target version'
               Assert-True (@($script:events | Where-Object { $_.Name -ieq 'Updater.exe' -and $_.ParentProcessId -eq $oldProcess.Id }).Count -gt 0) 'Real updater helper process was observed'
               $after = Read-Json (Join-Path $dataRoot 'state.json')
               Assert-True (@($after.Entries).Count -eq 1 -and $after.Entries[0].Id -eq $entryId -and [DateTimeOffset]::Parse($after.Entries[0].At) -eq $now.AddMinutes(-3)) 'Original hydration entry survived unchanged'
