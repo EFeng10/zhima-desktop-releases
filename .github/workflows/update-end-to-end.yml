@@ -43,6 +43,11 @@ jobs:
           # Run only on a disposable Windows account. Never overwrite an existing user's data.
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
+          # Keep source ASCII: Windows PowerShell 5 may decode a BOM-less Actions script as ANSI.
+          $uiPetTitle = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('6Iqd6bq75Zad5rC0'))
+          $uiCheckUpdates = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('5qOA5p+l5pu05paw'))
+          $uiUpdateTitle = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('6Iqd6bq7IMK3IOajgOafpeabtOaWsA=='))
+          $uiInstallUpdate = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('5LiL6L295bm26YeN5ZCv5pu05paw'))
           Set-StrictMode -Version 2.0
           if ($env:OS -ne 'Windows_NT' -or -not $DisposableRunner) { throw 'Requires Windows and explicit -DisposableRunner.' }
           if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository.' }
@@ -173,17 +178,17 @@ jobs:
               $oldProcess = Start-Process -FilePath $targetExe -WorkingDirectory $fixtureRoot -PassThru
               $oldStartTicks = $oldProcess.StartTime.ToUniversalTime().Ticks
               $script:ownedProcesses[$oldProcess.Id] = $oldStartTicks
-              $pet = Wait-Ui $oldProcess.Id '芝麻喝水' 45
+              $pet = Wait-Ui $oldProcess.Id $uiPetTitle 45
               Capture '01-old-app'
               # Right-click the solid footer, avoiding transparent pet-window pixels and action buttons.
               $rectangle = $pet.Current.BoundingRectangle
               [void][UpdateE2EMouse]::SetCursorPos([int]($rectangle.Left + 45), [int]($rectangle.Bottom - 28))
               [UpdateE2EMouse]::mouse_event(0x0008,0,0,0,[UIntPtr]::Zero)
               [UpdateE2EMouse]::mouse_event(0x0010,0,0,0,[UIntPtr]::Zero)
-              Invoke-Ui (Wait-Ui $oldProcess.Id '检查更新' 15)
-              [void](Wait-Ui $oldProcess.Id '芝麻 · 检查更新' 20)
-              Invoke-Ui (Wait-Ui $oldProcess.Id '检查更新' 15)
-              $installButton = Wait-Ui $oldProcess.Id '下载并重启更新' 60
+              Invoke-Ui (Wait-Ui $oldProcess.Id $uiCheckUpdates 15)
+              [void](Wait-Ui $oldProcess.Id $uiUpdateTitle 20)
+              Invoke-Ui (Wait-Ui $oldProcess.Id $uiCheckUpdates 15)
+              $installButton = Wait-Ui $oldProcess.Id $uiInstallUpdate 60
               Capture '02-update-available'
               Write-Log 'Invoking actual download-and-restart UI button'
               Invoke-Ui $installButton
@@ -221,7 +226,7 @@ jobs:
               Assert-True (@($after.Entries).Count -eq 1 -and $after.Entries[0].Id -eq $entryId -and [DateTimeOffset]::Parse($after.Entries[0].At) -eq $now.AddMinutes(-3)) 'Original hydration entry survived unchanged'
               Assert-True (@($after.Tasks).Count -eq 1 -and $after.Tasks[0].Id -eq $memoId -and $after.Tasks[0].Title -ceq 'Update E2E preserved memo' -and $after.Tasks[0].Notes -ceq 'Synthetic data only' -and -not $after.Tasks[0].IsCompleted) 'Original memo survived unchanged'
               Assert-True ($after.Settings.IntervalMode -eq '40' -and $after.Settings.SoundEnabled -eq $false -and $after.Settings.PetScale -eq 1) 'User preferences survived update'
-              [void](Wait-Ui $newProcess.Id '芝麻喝水' 30)
+              [void](Wait-Ui $newProcess.Id $uiPetTitle 30)
               Capture '04-new-app'
               $script:passed = $true
               Write-Log 'PASS: complete published-binary UI update, helper, replacement, restart, health and record preservation.'
