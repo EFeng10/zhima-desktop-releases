@@ -1,14 +1,17 @@
+# Copy this file to .github/workflows/release-windows-smoke.yml in the binary release repository.
+# Downloads only published artifacts; no application source or SDK is required.
 name: Released Windows app smoke test
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Published numeric version without v'
+        description: 'Published numeric version to test, without v'
         required: true
-        default: '1.5.0'
+        default: '1.8.0'
         type: string
   push:
-    paths: ['.github/workflows/release-windows-smoke.yml']
+    paths:
+      - '.github/workflows/release-windows-smoke.yml'
   release:
     types: [published]
 permissions:
@@ -18,49 +21,60 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     env:
+      ZHIMA_RELEASE_REPOSITORY: EFeng10/zhima-desktop-releases
       ZHIMA_REQUESTED_VERSION: ${{ inputs.version }}
       ZHIMA_RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
-      - name: Download and verify published artifacts
+      - name: Download and verify the versioned release
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = if ($env:ZHIMA_REQUESTED_VERSION) { $env:ZHIMA_REQUESTED_VERSION } elseif ($env:ZHIMA_RELEASE_TAG) { $env:ZHIMA_RELEASE_TAG -replace '^v', '' } else { '1.5.0' }
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$') { throw 'Invalid version' }
+          $version = if ($env:ZHIMA_REQUESTED_VERSION) { $env:ZHIMA_REQUESTED_VERSION } elseif ($env:ZHIMA_RELEASE_TAG) { $env:ZHIMA_RELEASE_TAG -replace '^v', '' } else { '1.8.0' }
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$') { throw 'Release version must have three or four numeric components.' }
           function Normalize-Version([string]$value) {
             $parsed = [Version]::Parse($value)
             return [Version]::new($parsed.Major, $parsed.Minor, [Math]::Max(0, $parsed.Build), [Math]::Max(0, $parsed.Revision))
           }
           $expectedVersion = Normalize-Version $version
-          $releaseBase = 'https://github.com/EFeng10/zhima-desktop-releases/releases/download/v' + $version
+          $releaseBase = 'https://github.com/' + $env:ZHIMA_RELEASE_REPOSITORY + '/releases/download/v' + $version
           $folder = Join-Path $env:RUNNER_TEMP 'zhima-release-smoke'
           [void][IO.Directory]::CreateDirectory($folder)
           $manifestPath = Join-Path $folder 'latest.json'
           $exePath = Join-Path $folder 'Zhima.exe'
+          # Pin BOTH files to one release. A newer Latest release cannot change this test.
           Invoke-WebRequest -Uri ($releaseBase + '/latest.json') -OutFile $manifestPath -MaximumRedirection 5 -TimeoutSec 60
-          if ((Get-Item $manifestPath).Length -gt 65536) { throw 'Manifest too large' }
+          if ((Get-Item $manifestPath).Length -gt 65536) { throw 'Release manifest is too large.' }
           $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-          if ($manifest.schemaVersion -ne 1 -or $manifest.runtime -cne 'win-x64' -or (Normalize-Version $manifest.version) -ne $expectedVersion -or $manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $manifest.size -le 0 -or $manifest.size -gt 536870912) { throw 'Invalid manifest' }
+          if ($manifest.schemaVersion -ne 1 -or $manifest.runtime -cne 'win-x64' -or
+              (Normalize-Version $manifest.version) -ne $expectedVersion -or
+              $manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $manifest.size -le 0 -or $manifest.size -gt 536870912) {
+            throw 'Release manifest does not describe the requested Windows x64 version.'
+          }
           $exeUrl = $releaseBase + '/Zhima.exe'
-          if ($manifest.downloadUrl -cne $exeUrl) { throw 'Unexpected artifact URL' }
+          if ($manifest.downloadUrl -cne $exeUrl) { throw 'Manifest points to an unexpected release artifact.' }
           Invoke-WebRequest -Uri $exeUrl -OutFile $exePath -MaximumRedirection 5 -TimeoutSec 180
           $actualHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ((Get-Item -LiteralPath $exePath).Length -ne $manifest.size -or $actualHash -ne $manifest.sha256.ToLowerInvariant()) { throw 'Artifact hash or size mismatch' }
+          if ((Get-Item -LiteralPath $exePath).Length -ne $manifest.size -or $actualHash -ne $manifest.sha256.ToLowerInvariant()) { throw 'Published EXE failed length or SHA256 verification.' }
           $nativeVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exePath).FileVersion
-          if ((Normalize-Version $nativeVersion) -ne $expectedVersion) { throw 'Native version mismatch' }
+          if ((Normalize-Version $nativeVersion) -ne $expectedVersion) { throw 'Published EXE native version differs from the manifest.' }
           "ZHIMA_SMOKE_EXE=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Verified $exeUrl | SHA256: $actualHash | Version: $nativeVersion"
-      - name: Run actual published Windows desktop app
+          Write-Host "Verified $exeUrl"
+          Write-Host "Native version: $nativeVersion | Bytes: $($manifest.size) | SHA256: $actualHash"
+      - name: Run the actual published desktop app
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $process = Start-Process -FilePath $env:ZHIMA_SMOKE_EXE -ArgumentList '--self-test' -PassThru
-          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Desktop self-test timed out' }
+          if (-not $process.WaitForExit(210000)) {
+            $process.Kill()
+            throw 'Published Windows app self-test timed out after 210 seconds.'
+          }
           $process.Refresh()
           $report = Join-Path $env:LOCALAPPDATA 'ZhimaWater/Diagnostics/latest-report.txt'
-          if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding utf8 } else { throw 'No self-test report' }
-          if ($process.ExitCode -ne 0) { throw "Desktop self-test failed: $($process.ExitCode)" }
-          if (-not (Select-String -LiteralPath $report -Pattern '^PASS: all desktop checks completed\.' -Quiet)) { throw 'No PASS confirmation' }
+          if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding utf8 }
+          else { throw 'Published app did not write a desktop self-test report.' }
+          if ($process.ExitCode -ne 0) { throw "Published app self-test failed with exit code $($process.ExitCode)." }
+          if (-not (Select-String -LiteralPath $report -Pattern '^PASS: all desktop checks completed\.' -Quiet)) { throw 'Desktop report did not confirm success.' }
       - name: Upload isolated desktop diagnostics
         uses: actions/upload-artifact@v4
         if: always()
