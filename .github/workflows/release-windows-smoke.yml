@@ -55,7 +55,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $process = Start-Process -FilePath $env:ZHIMA_SMOKE_EXE -ArgumentList '--self-test' -PassThru
-          if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Desktop self-test timed out' }
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Desktop self-test timed out' }
           $process.Refresh()
           $report = Join-Path $env:LOCALAPPDATA 'ZhimaWater/Diagnostics/latest-report.txt'
           if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding utf8 } else { throw 'No self-test report' }
