@@ -7,12 +7,12 @@ on:
       from_version:
         description: 'Published old numeric version'
         required: true
-        default: '1.6.0'
+        default: '1.7.0'
         type: string
       to_version:
         description: 'Published new numeric version'
         required: true
-        default: '1.7.0'
+        default: '1.8.0'
         type: string
   push:
     paths:
@@ -24,8 +24,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 12
     env:
-      ZHIMA_FROM_VERSION: ${{ inputs.from_version || '1.6.0' }}
-      ZHIMA_TO_VERSION: ${{ inputs.to_version || '1.7.0' }}
+      ZHIMA_FROM_VERSION: ${{ inputs.from_version || '1.7.0' }}
+      ZHIMA_TO_VERSION: ${{ inputs.to_version || '1.8.0' }}
     steps:
       - name: Drive published application UI through actual restart
         shell: powershell
@@ -34,8 +34,8 @@ jobs:
           #Requires -Version 5.1
           [CmdletBinding()]
           param(
-              [string]$FromVersion = '1.6.0',
-              [string]$ToVersion = '1.7.0',
+              [string]$FromVersion = '1.7.0',
+              [string]$ToVersion = '1.8.0',
               [string]$Repository = 'EFeng10/zhima-desktop-releases',
               [string]$OutputDirectory = (Join-Path $env:TEMP 'zhima-update-e2e/artifacts'),
               [switch]$DisposableRunner
