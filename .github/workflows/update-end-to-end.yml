@@ -1,0 +1,256 @@
+# Binary-only black-box update reproduction. No application source or SDK is downloaded.
+# This file embeds tools/Test-UpdateEndToEnd.ps1 so it can be uploaded alone.
+name: Published Windows update end-to-end
+on:
+  workflow_dispatch:
+    inputs:
+      from_version:
+        description: 'Published old numeric version'
+        required: true
+        default: '1.6.0'
+        type: string
+      to_version:
+        description: 'Published new numeric version'
+        required: true
+        default: '1.7.0'
+        type: string
+  push:
+    paths:
+      - '.github/workflows/update-end-to-end.yml'
+permissions:
+  contents: read
+jobs:
+  real-update:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      ZHIMA_FROM_VERSION: ${{ inputs.from_version || '1.6.0' }}
+      ZHIMA_TO_VERSION: ${{ inputs.to_version || '1.7.0' }}
+    steps:
+      - name: Drive published application UI through actual restart
+        shell: powershell
+        run: |
+          & {
+          #Requires -Version 5.1
+          [CmdletBinding()]
+          param(
+              [string]$FromVersion = '1.6.0',
+              [string]$ToVersion = '1.7.0',
+              [string]$Repository = 'EFeng10/zhima-desktop-releases',
+              [string]$OutputDirectory = (Join-Path $env:TEMP 'zhima-update-e2e/artifacts'),
+              [switch]$DisposableRunner
+          )
+          # Run only on a disposable Windows account. Never overwrite an existing user's data.
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2.0
+          if ($env:OS -ne 'Windows_NT' -or -not $DisposableRunner) { throw 'Requires Windows and explicit -DisposableRunner.' }
+          if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid repository.' }
+          foreach ($releaseVersion in @($FromVersion, $ToVersion)) {
+              if ($releaseVersion -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') { throw 'Versions must contain three or four numeric components.' }
+          }
+          function Normalize-Version([string]$value) {
+              $parsed = [Version]::Parse($value)
+              [Version]::new($parsed.Major, $parsed.Minor, [Math]::Max(0, $parsed.Build), [Math]::Max(0, $parsed.Revision))
+          }
+          if ((Normalize-Version $ToVersion) -le (Normalize-Version $FromVersion)) { throw 'Target must be newer than source.' }
+          $dataRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ZhimaWater'
+          if (Test-Path -LiteralPath $dataRoot) { throw "Refusing existing app data: $dataRoot. Use a fresh disposable Windows runner." }
+          if (Get-Process -Name Zhima, Updater -ErrorAction SilentlyContinue) { throw 'An app/helper is already running. Use a fresh runner.' }
+          [void][IO.Directory]::CreateDirectory($OutputDirectory)
+          $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+          $fixtureRoot = Join-Path $env:TEMP ('Zhima-UpdateE2E-' + [Guid]::NewGuid().ToString('N'))
+          [void][IO.Directory]::CreateDirectory($fixtureRoot)
+          $targetExe = Join-Path $fixtureRoot 'Zhima.exe'
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $script:ownedProcesses = @{}
+          $script:events = New-Object System.Collections.Generic.List[object]
+          $script:eventSource = 'ZhimaUpdateE2E-' + [Guid]::NewGuid().ToString('N')
+          $script:eventRegistered = $false
+          $script:passed = $false
+          function Write-Log([string]$message) {
+              $line = [DateTimeOffset]::Now.ToString('o') + ' ' + $message
+              Write-Host $line
+              [IO.File]::AppendAllText((Join-Path $OutputDirectory 'trace.txt'), $line + [Environment]::NewLine, $utf8)
+          }
+          function Write-Json($value, [string]$path) { [IO.File]::WriteAllText($path, ($value | ConvertTo-Json -Depth 12), $utf8) }
+          function Read-Json([string]$path) { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
+          function Assert-True([bool]$condition, [string]$message) { if (-not $condition) { throw $message }; Write-Log ('PASS: ' + $message) }
+          function Read-Release([string]$version) {
+              $releaseBase = "https://github.com/$Repository/releases/download/v$version"
+              $manifestPath = Join-Path $OutputDirectory ('manifest-' + $version + '.json')
+              Invoke-WebRequest -UseBasicParsing -Uri ($releaseBase + '/latest.json') -OutFile $manifestPath -MaximumRedirection 5 -TimeoutSec 60
+              if ((Get-Item -LiteralPath $manifestPath).Length -gt 65536) { throw 'Manifest exceeds 64 KiB.' }
+              $manifest = Read-Json $manifestPath
+              Assert-True ($manifest.schemaVersion -eq 1 -and $manifest.runtime -ceq 'win-x64' -and
+                  (Normalize-Version $manifest.version) -eq (Normalize-Version $version) -and
+                  $manifest.sha256 -match '^[a-fA-F0-9]{64}$' -and $manifest.size -gt 0 -and $manifest.size -le 536870912 -and
+                  $manifest.downloadUrl -ceq ($releaseBase + '/Zhima.exe')) "Pinned manifest v$version is valid"
+              return $manifest
+          }
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase, System.Windows.Forms, System.Drawing
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class UpdateE2EMouse {
+           [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
+           [DllImport("user32.dll")] public static extern void mouse_event(uint flags,uint x,uint y,uint data,UIntPtr extra);
+          }
+          '@
+          function Find-Ui([int]$processId, [string]$name, [string]$automationId = '') {
+              $conditions = New-Object System.Collections.Generic.List[System.Windows.Automation.Condition]
+              $conditions.Add((New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $processId)))
+              if ($name) { $conditions.Add((New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name))) }
+              if ($automationId) { $conditions.Add((New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $automationId))) }
+              $condition = if ($conditions.Count -eq 1) { $conditions[0] } else { New-Object System.Windows.Automation.AndCondition -ArgumentList (,($conditions.ToArray())) }
+              [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+          }
+          function Wait-Ui([int]$processId, [string]$name, [int]$seconds = 30) {
+              $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+              do {
+                  $element = Find-Ui $processId $name
+                  if ($null -ne $element -and $element.Current.IsEnabled -and -not $element.Current.IsOffscreen) { return $element }
+                  Start-Sleep -Milliseconds 250
+              } while ([DateTime]::UtcNow -lt $deadline)
+              throw "UI control not available: $name (PID $processId)"
+          }
+          function Invoke-Ui($element) {
+              $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+              $pattern.Invoke()
+          }
+          function Capture([string]$label) {
+              try {
+                  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                  $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+                  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                  try { $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size); $bitmap.Save((Join-Path $OutputDirectory ($label + '.png')), [System.Drawing.Imaging.ImageFormat]::Png) }
+                  finally { $graphics.Dispose(); $bitmap.Dispose() }
+              } catch { Write-Log ('Screenshot failed: ' + $_.Exception.Message) }
+              try {
+                  $lines = New-Object System.Collections.Generic.List[string]
+                  foreach ($appProcess in @(Get-Process -Name Zhima, Updater -ErrorAction SilentlyContinue)) {
+                      $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $appProcess.Id)
+                      $elements = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+                      foreach ($element in @($elements | Select-Object -First 300)) {
+                          try { $lines.Add(('PID={0} type={1} id={2} name={3} enabled={4} offscreen={5}' -f $appProcess.Id, $element.Current.ControlType.ProgrammaticName, $element.Current.AutomationId, $element.Current.Name, $element.Current.IsEnabled, $element.Current.IsOffscreen)) } catch { }
+                      }
+                  }
+                  [IO.File]::WriteAllLines((Join-Path $OutputDirectory ($label + '-uia.txt')), $lines, $utf8)
+              } catch { Write-Log ('UIA capture failed: ' + $_.Exception.Message) }
+          }
+          function Observe-Processes {
+              foreach ($event in @(Get-Event -SourceIdentifier $script:eventSource -ErrorAction SilentlyContinue)) {
+                  $value = $event.SourceEventArgs.NewEvent
+                  $script:events.Add([pscustomobject]@{ Name = $value.ProcessName; ProcessId = [int]$value.ProcessID; ParentProcessId = [int]$value.ParentProcessID; Time = [string]$value.TIME_CREATED })
+                  Remove-Event -EventIdentifier $event.EventIdentifier
+              }
+              foreach ($appProcess in @(Get-Process -Name Zhima, Updater -ErrorAction SilentlyContinue)) {
+                  try {
+                      $path = $appProcess.MainModule.FileName
+                      if ($path -ieq $targetExe -or $path.StartsWith(($dataRoot + '\Updates\'), [StringComparison]::OrdinalIgnoreCase)) {
+                          $script:ownedProcesses[$appProcess.Id] = $appProcess.StartTime.ToUniversalTime().Ticks
+                      }
+                  } catch { }
+              }
+          }
+          try {
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+              Write-Log "Starting real UI update v$FromVersion -> v$ToVersion; target=$targetExe; data=$dataRoot"
+              $oldManifest = Read-Release $FromVersion
+              $newManifest = Read-Release $ToVersion
+              Invoke-WebRequest -UseBasicParsing -Uri $oldManifest.downloadUrl -OutFile $targetExe -MaximumRedirection 5 -TimeoutSec 180
+              Assert-True ((Get-Item $targetExe).Length -eq $oldManifest.size -and (Get-FileHash $targetExe -Algorithm SHA256).Hash -ieq $oldManifest.sha256) 'Old published EXE matches manifest hash and size'
+              Assert-True ((Normalize-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($targetExe).FileVersion)) -eq (Normalize-Version $FromVersion)) 'Old EXE native version matches'
+              [void][IO.Directory]::CreateDirectory($dataRoot)
+              $now = [DateTimeOffset]::Now
+              $entryId = [Guid]::NewGuid().ToString(); $memoId = [Guid]::NewGuid().ToString()
+              $fixtureState = @{ Settings = @{ IntervalMode = '40'; SoundEnabled = $false; FollowCursor = $false; PlayfulIdle = $false; PetScale = 1; WindowX = 80; WindowY = 80 }; Entries = @(@{ Id = $entryId; At = $now.AddMinutes(-3).ToString('o') }); Tasks = @(@{ Id = $memoId; Title = 'Update E2E preserved memo'; Notes = 'Synthetic data only'; CreatedAt = $now.ToString('o'); Repeat = 'none'; IsCompleted = $false; ReminderPending = $false }); NextReminderAt = $now.AddMinutes(40).ToString('o'); ReminderPending = $false }
+              Write-Json $fixtureState (Join-Path $dataRoot 'state.json')
+              Write-Json $fixtureState (Join-Path $OutputDirectory 'state-before.json')
+              Write-Json @{ feedUrl = "https://github.com/$Repository/releases/download/v$ToVersion/latest.json"; autoCheckEnabled = $false } (Join-Path $dataRoot 'update-settings.json')
+              Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName='Updater.exe' OR ProcessName='Zhima.exe'" -SourceIdentifier $script:eventSource | Out-Null
+              $script:eventRegistered = $true
+              $oldProcess = Start-Process -FilePath $targetExe -WorkingDirectory $fixtureRoot -PassThru
+              $oldStartTicks = $oldProcess.StartTime.ToUniversalTime().Ticks
+              $script:ownedProcesses[$oldProcess.Id] = $oldStartTicks
+              $pet = Wait-Ui $oldProcess.Id '芝麻喝水' 45
+              Capture '01-old-app'
+              # Right-click the solid footer, avoiding transparent pet-window pixels and action buttons.
+              $rectangle = $pet.Current.BoundingRectangle
+              [void][UpdateE2EMouse]::SetCursorPos([int]($rectangle.Left + 45), [int]($rectangle.Bottom - 28))
+              [UpdateE2EMouse]::mouse_event(0x0008,0,0,0,[UIntPtr]::Zero)
+              [UpdateE2EMouse]::mouse_event(0x0010,0,0,0,[UIntPtr]::Zero)
+              Invoke-Ui (Wait-Ui $oldProcess.Id '检查更新' 15)
+              [void](Wait-Ui $oldProcess.Id '芝麻 · 检查更新' 20)
+              Invoke-Ui (Wait-Ui $oldProcess.Id '检查更新' 15)
+              $installButton = Wait-Ui $oldProcess.Id '下载并重启更新' 60
+              Capture '02-update-available'
+              Write-Log 'Invoking actual download-and-restart UI button'
+              Invoke-Ui $installButton
+              $deadline = [DateTime]::UtcNow.AddSeconds(330)
+              $lastState = ''; $result = $null; $job = $null; $jobDirectory = $null
+              do {
+                  Observe-Processes
+                  $jobs = @(Get-ChildItem -LiteralPath (Join-Path $dataRoot 'Updates') -Filter job.json -Recurse -ErrorAction SilentlyContinue)
+                  if ($jobs.Count -gt 1) { throw 'Unexpected multiple update jobs in fresh fixture.' }
+                  if ($jobs.Count -eq 1) {
+                      $jobDirectory = $jobs[0].DirectoryName
+                      $job = Read-Json $jobs[0].FullName
+                      $resultPath = Join-Path $jobDirectory 'result.json'
+                      if (Test-Path -LiteralPath $resultPath) {
+                          $result = Read-Json $resultPath
+                          if ($result.state -ne $lastState) { $lastState = $result.state; Write-Log ("Installer state: $lastState : " + $result.message); Capture ('03-state-' + $lastState) }
+                          if ($result.state -in @('Success','Failed','Busy','RolledBack','RollbackFailed','RestartFailed','Unconfirmed')) { break }
+                      }
+                  }
+                  Start-Sleep -Milliseconds 300
+              } while ([DateTime]::UtcNow -lt $deadline)
+              Observe-Processes
+              if ($null -eq $result) { throw 'No installer result after clicking update. Inspect UI, error.log, and process trace.' }
+              Assert-True ($result.state -eq 'Success') ('Installer reached Success, actual=' + $result.state + '; ' + $result.message)
+              Assert-True ($job.targetPath -ieq $targetExe -and $job.parentPid -eq $oldProcess.Id -and $job.parentStartUtcTicks -eq $oldStartTicks) 'Job identifies exact old path and process instance'
+              $oldProcess.Refresh()
+              Assert-True $oldProcess.HasExited 'Old application process exited'
+              Assert-True ((Get-Item $targetExe).Length -eq $newManifest.size -and (Get-FileHash $targetExe -Algorithm SHA256).Hash -ieq $newManifest.sha256) 'Same target path contains exact new published EXE'
+              Assert-True ((Normalize-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($targetExe).FileVersion)) -eq (Normalize-Version $ToVersion)) 'Installed native version matches target'
+              $ack = Read-Json (Join-Path $jobDirectory 'health.json')
+              $newProcess = Get-Process -Id $ack.processId -ErrorAction Stop
+              Assert-True ($newProcess.Id -ne $oldProcess.Id -and $newProcess.MainModule.FileName -ieq $targetExe -and $newProcess.StartTime.ToUniversalTime().Ticks -eq $ack.processStartUtcTicks -and $ack.token -ceq $job.healthToken -and $ack.targetPath -ieq $targetExe -and (Normalize-Version $ack.version) -eq (Normalize-Version $ToVersion)) 'New process at original path produced matching full-startup health acknowledgement'
+              Assert-True (@($script:events | Where-Object { $_.Name -ieq 'Updater.exe' -and $_.ParentProcessId -eq $oldProcess.Id }).Count -gt 0) 'Real updater helper process was observed'
+              $after = Read-Json (Join-Path $dataRoot 'state.json')
+              Assert-True (@($after.Entries).Count -eq 1 -and $after.Entries[0].Id -eq $entryId -and [DateTimeOffset]::Parse($after.Entries[0].At) -eq $now.AddMinutes(-3)) 'Original hydration entry survived unchanged'
+              Assert-True (@($after.Tasks).Count -eq 1 -and $after.Tasks[0].Id -eq $memoId -and $after.Tasks[0].Title -ceq 'Update E2E preserved memo' -and $after.Tasks[0].Notes -ceq 'Synthetic data only' -and -not $after.Tasks[0].IsCompleted) 'Original memo survived unchanged'
+              Assert-True ($after.Settings.IntervalMode -eq '40' -and $after.Settings.SoundEnabled -eq $false -and $after.Settings.PetScale -eq 1) 'User preferences survived update'
+              [void](Wait-Ui $newProcess.Id '芝麻喝水' 30)
+              Capture '04-new-app'
+              $script:passed = $true
+              Write-Log 'PASS: complete published-binary UI update, helper, replacement, restart, health and record preservation.'
+          } catch {
+              Write-Log ('FAIL: ' + $_.Exception.ToString())
+              [IO.File]::WriteAllText((Join-Path $OutputDirectory 'failure.txt'), ($_ | Out-String), $utf8)
+              Capture '99-failure'
+              throw
+          } finally {
+              try { Observe-Processes; Write-Json $script:events.ToArray() (Join-Path $OutputDirectory 'process-starts.json') } catch { }
+              if ($script:eventRegistered) { Unregister-Event -SourceIdentifier $script:eventSource -ErrorAction SilentlyContinue; Get-Event -SourceIdentifier $script:eventSource -ErrorAction SilentlyContinue | Remove-Event }
+              # Only stop exact fixture processes, with start-time protection against PID reuse.
+              foreach ($processKey in @($script:ownedProcesses.Keys)) {
+                  try { $owned = Get-Process -Id $processKey -ErrorAction Stop; if ($owned.StartTime.ToUniversalTime().Ticks -eq $script:ownedProcesses[$processKey]) { $owned.Kill(); [void]$owned.WaitForExit(5000) } } catch { }
+              }
+              if (Test-Path -LiteralPath $dataRoot) {
+                  foreach ($file in @(Get-ChildItem -LiteralPath $dataRoot -Recurse -File | Where-Object { $_.Extension -in @('.json','.log','.txt') -or $_.Name -eq 'state.json.bak' })) {
+                      try { $relative = $file.FullName.Substring($dataRoot.Length).TrimStart('\'); $copyPath = Join-Path (Join-Path $OutputDirectory 'fixture-data') $relative; [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($copyPath)); Copy-Item -LiteralPath $file.FullName -Destination $copyPath } catch { }
+                  }
+              }
+              try { if (Test-Path $targetExe) { Write-Json @{ path = $targetExe; sha256 = (Get-FileHash $targetExe -Algorithm SHA256).Hash; version = [Diagnostics.FileVersionInfo]::GetVersionInfo($targetExe).FileVersion; bytes = (Get-Item $targetExe).Length; passed = $script:passed } (Join-Path $OutputDirectory 'final-executable.json') } } catch { }
+              Write-Log ("Artifacts: $OutputDirectory (only fixture diagnostics; no source or binaries)")
+          }
+          
+          } -FromVersion $env:ZHIMA_FROM_VERSION -ToVersion $env:ZHIMA_TO_VERSION -OutputDirectory (Join-Path $env:RUNNER_TEMP "zhima-update-e2e/artifacts") -DisposableRunner
+      - name: Upload screenshots, UI tree, process trace, and synthetic data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-update-end-to-end
+          path: ${{ runner.temp }}/zhima-update-e2e/artifacts
+          if-no-files-found: warn
+          retention-days: 14
