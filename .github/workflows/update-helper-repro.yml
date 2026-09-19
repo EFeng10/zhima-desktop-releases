@@ -1,0 +1,73 @@
+name: Published updater handoff reproduction
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/update-helper-repro.yml']
+permissions:
+  contents: read
+jobs:
+  handoff:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - name: Exercise the old published helper with the new published app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $data = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ZhimaWater'
+          if (Test-Path $data) { throw 'Disposable runner must not contain existing pet data.' }
+          $folder = Join-Path $env:RUNNER_TEMP 'zhima handoff 芝麻'
+          $evidence = Join-Path $env:RUNNER_TEMP 'zhima-handoff-evidence'
+          [void][IO.Directory]::CreateDirectory($folder)
+          [void][IO.Directory]::CreateDirectory($evidence)
+          function Fetch-Version([string]$version, [string]$destination) {
+            $base = "https://github.com/EFeng10/zhima-desktop-releases/releases/download/v$version"
+            $manifest = Invoke-RestMethod "$base/latest.json"
+            Invoke-WebRequest "$base/Zhima.exe" -OutFile $destination -TimeoutSec 180
+            if ((Get-Item $destination).Length -ne $manifest.size -or (Get-FileHash $destination).Hash -ne $manifest.sha256) { throw 'Published payload verification failed.' }
+            return $manifest
+          }
+          $target = Join-Path $folder '芝麻.exe'
+          $old = Fetch-Version '1.6.0' $target
+          $candidate = Join-Path $folder 'download.exe'
+          $new = Fetch-Version '1.7.0' $candidate
+          $jobId = [Guid]::NewGuid().ToString('N')
+          $jobFolder = Join-Path $data "Updates/$jobId"
+          [void][IO.Directory]::CreateDirectory($jobFolder)
+          Copy-Item $candidate (Join-Path $jobFolder 'payload.exe')
+          Copy-Item $target (Join-Path $jobFolder 'Updater.exe')
+          $original = Start-Process $target -PassThru
+          $helper = $null
+          try {
+            Start-Sleep -Seconds 3
+            if ($original.HasExited) { throw 'Original app exited before handoff.' }
+            $job = [ordered]@{schema=1;jobId=$jobId;targetPath=$target;expectedVersion='1.7.0.0';expectedSha256=$new.sha256;expectedSize=$new.size;originalVersion='1.6.0.0';originalSha256=$old.sha256;originalSize=$old.size;parentPid=$original.Id;parentStartUtcTicks=$original.StartTime.ToUniversalTime().Ticks;healthToken=[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32));createdAt=[DateTimeOffset]::UtcNow.ToString('O')}
+            $jobPath = Join-Path $jobFolder 'job.json'
+            [IO.File]::WriteAllText($jobPath, ($job | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $jobFolder 'Updater.exe'))
+            $start.UseShellExecute=$false
+            $start.ArgumentList.Add('--apply-update'); $start.ArgumentList.Add($jobPath); $start.ArgumentList.Add((Get-FileHash $jobPath).Hash)
+            $helper = [Diagnostics.Process]::Start($start)
+            Start-Sleep -Seconds 2
+            # The old app is disposable fixture data. End it to exercise helper handoff independently of UI.
+            $original.Kill(); [void]$original.WaitForExit(10000)
+            if (-not $helper.WaitForExit(240000)) { throw 'Helper did not finish within four minutes.' }
+            $result = Get-Content (Join-Path $jobFolder 'result.json') -Raw | ConvertFrom-Json
+            $result | ConvertTo-Json | Tee-Object -FilePath (Join-Path $evidence 'result.json')
+            "Helper exit: $($helper.ExitCode)" | Tee-Object -FilePath (Join-Path $evidence 'summary.txt')
+            $actual = (Get-FileHash $target).Hash
+            "Installed SHA256: $actual" | Tee-Object -FilePath (Join-Path $evidence 'summary.txt') -Append
+            if ($result.state -ne 'Success' -or $helper.ExitCode -ne 0 -or $actual -ne $new.sha256) { throw 'Published updater failed to install and confirm the new version.' }
+            $health = Get-Content (Join-Path $jobFolder 'health.json') -Raw | ConvertFrom-Json
+            if ($health.version -ne '1.7.0.0') { throw 'Wrong process acknowledged startup.' }
+            'PASS old helper replaces the app and confirms the new process.' | Tee-Object -FilePath (Join-Path $evidence 'summary.txt') -Append
+          } finally {
+            Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $target -or $_.ExecutablePath -eq (Join-Path $jobFolder 'Updater.exe') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Get-ChildItem $data -Recurse -File -Include *.log,*result.json,health.json,error.log | ForEach-Object { Copy-Item $_.FullName (Join-Path $evidence ($_.Directory.Name+'-'+$_.Name)) }
+          }
+      - name: Upload handoff evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Published-updater-handoff
+          path: ${{ runner.temp }}/zhima-handoff-evidence
